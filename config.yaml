@@ -1,0 +1,25 @@
+# iNaturalist photo download settings
+# Run: python download_photos.py
+
+# How many NEW photos to download per species this run.
+# Existing photos in metadata.csv are skipped.
+# 0 = unlimited. If fewer photos exist on iNaturalist, download whatever is available.
+photo_limit: 20
+
+# Photo size: original / large / medium / small / thumb / square
+size: original
+
+# Observation quality: all / research / needs_id / casual
+quality: all
+
+# true = skip photos with all-rights-reserved licenses
+licensed_only: false
+
+# Output root. Each species gets its own subdirectory.
+out_dir: downloads
+
+# Scientific names to download. Each species is processed in order.
+species:
+  - Bactrocera dorsalis
+  - Bactrocera cucurbitae
+  - Ceratitis capitata
