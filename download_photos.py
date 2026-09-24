@@ -18,8 +18,8 @@ import yaml
 
 API_BASE = "https://api.inaturalist.org/v1"
 USER_AGENT = "download-inaturalist-images/1.0 (personal research)"
-API_DELAY_SEC = 1.0
-PHOTO_DELAY_SEC = 0.15
+DEFAULT_API_DELAY_SEC = 1.0
+DEFAULT_PHOTO_DELAY_SEC = 0.15
 PER_PAGE = 200
 PHOTO_SIZES = ("original", "large", "medium", "small", "thumb", "square")
 TAXON_URL_RE = re.compile(r"/taxa/(\d+)", re.IGNORECASE)
@@ -62,15 +62,20 @@ class RateLimitError(RuntimeError):
 
 
 class InatClient:
-    def __init__(self, session: requests.Session | None = None) -> None:
+    def __init__(
+        self,
+        session: requests.Session | None = None,
+        api_delay_sec: float = DEFAULT_API_DELAY_SEC,
+    ) -> None:
         self.session = session or requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
+        self.api_delay_sec = api_delay_sec
         self._last_api_call = 0.0
 
     def _throttle(self) -> None:
         elapsed = time.monotonic() - self._last_api_call
-        if elapsed < API_DELAY_SEC:
-            time.sleep(API_DELAY_SEC - elapsed)
+        if elapsed < self.api_delay_sec:
+            time.sleep(self.api_delay_sec - elapsed)
 
     def get_json(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         url = f"{API_BASE}{path}"
@@ -88,22 +93,28 @@ class InatClient:
         raise RateLimitError(f"Too many 429s from {url}")
 
     def search_taxon(self, query: str) -> dict[str, Any] | None:
-        data = self.get_json("/taxa", {"q": query, "is_active": "true"})
+        data = self.get_json(
+            "/taxa",
+            {"q": query, "is_active": "true", "rank": "species"},
+        )
         results = data.get("results") or []
-        if not results:
-            return None
         lowered = query.strip().lower()
         for item in results:
-            if (item.get("name") or "").lower() == lowered:
+            if (item.get("name") or "").lower() == lowered and item.get("rank") == "species":
                 return item
-        return results[0]
+        return None
 
     def get_taxon(self, taxon_id: int) -> dict[str, Any]:
         data = self.get_json(f"/taxa/{taxon_id}")
         results = data.get("results") or []
         if not results:
             raise ValueError(f"Taxon not found: taxon_id={taxon_id}")
-        return results[0]
+        taxon = results[0]
+        if taxon.get("rank") != "species":
+            raise ValueError(
+                f"taxon_id={taxon_id} is rank={taxon.get('rank')!r}; only species is allowed"
+            )
+        return taxon
 
     def iter_observations(
         self,
@@ -174,6 +185,16 @@ def parse_limit(value: str) -> int | None:
     return number
 
 
+def parse_delay(value: Any, name: str) -> float:
+    try:
+        delay = float(value)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"Invalid {name}: {value}") from exc
+    if delay < 0:
+        raise SystemExit(f"{name} cannot be negative")
+    return delay
+
+
 def parse_lat_lng(observation: dict[str, Any]) -> tuple[str, str]:
     geojson = observation.get("geojson") or {}
     coords = geojson.get("coordinates")
@@ -198,6 +219,27 @@ def flatten_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+WINDOWS_FORBIDDEN = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def sanitize_filename_part(text: str, fallback: str = "unknown", max_len: int = 80) -> str:
+    cleaned = WINDOWS_FORBIDDEN.sub("", flatten_text(text))
+    cleaned = cleaned.strip(" .")
+    if not cleaned:
+        cleaned = fallback
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip(" .")
+    return cleaned
+
+
+def make_photo_filename(taxon_name: str, place_guess: str, original_name: str) -> str:
+    species = sanitize_filename_part(taxon_name, fallback="unknown_species", max_len=60)
+    species = species.replace(" ", "_")
+    place = sanitize_filename_part(place_guess, fallback="unknown_location", max_len=80)
+    original = Path(original_name).name
+    return f"{species}_{place}_{original}"
+
+
 def limit_text(limit: int | None) -> str:
     return "unlimited" if limit is None else str(limit)
 
@@ -208,7 +250,7 @@ def resolve_taxon(client: InatClient, raw: str) -> dict[str, Any]:
         return client.get_taxon(taxon_id)
     taxon = client.search_taxon(name or raw)
     if taxon is None:
-        raise ValueError(f"Taxon not found: {raw}")
+        raise ValueError(f"Species not found: {raw}")
     return taxon
 
 
@@ -240,7 +282,7 @@ def load_existing_photo_ids(*csv_paths: Path) -> set[int]:
     for csv_path in csv_paths:
         if not csv_path.exists():
             continue
-        with csv_path.open(newline="", encoding="utf-8") as handle:
+        with csv_path.open(newline="", encoding="utf-8-sig") as handle:
             reader = csv.DictReader(handle)
             for row in reader:
                 try:
@@ -251,8 +293,9 @@ def load_existing_photo_ids(*csv_paths: Path) -> set[int]:
 
 
 def append_csv_row(csv_path: Path, row: dict[str, Any]) -> None:
-    new_file = not csv_path.exists()
-    with csv_path.open("a", newline="", encoding="utf-8") as handle:
+    new_file = not csv_path.exists() or csv_path.stat().st_size == 0
+    encoding = "utf-8-sig" if new_file else "utf-8"
+    with csv_path.open("a", newline="", encoding=encoding) as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, lineterminator="\n")
         if new_file:
             writer.writeheader()
@@ -386,6 +429,12 @@ def build_settings_from_config(data: dict[str, Any]) -> dict[str, Any]:
         "quality": quality,
         "licensed_only": bool(data.get("licensed_only", False)),
         "out_dir": Path(str(data.get("out_dir") or "downloads")),
+        "api_delay_sec": parse_delay(
+            data.get("api_delay_sec", DEFAULT_API_DELAY_SEC), "api_delay_sec"
+        ),
+        "photo_delay_sec": parse_delay(
+            data.get("photo_delay_sec", DEFAULT_PHOTO_DELAY_SEC), "photo_delay_sec"
+        ),
         "species": normalize_species(data.get("species")),
     }
 
@@ -398,6 +447,7 @@ def download_taxon_photos(
     quality: str = "all",
     limit: int | None = None,
     licensed_only: bool = False,
+    photo_delay_sec: float = DEFAULT_PHOTO_DELAY_SEC,
     source_config: Path | None = None,
     extra_settings: dict[str, Any] | None = None,
 ) -> None:
@@ -408,9 +458,9 @@ def download_taxon_photos(
     common = taxon.get("preferred_common_name")
     label = f"{taxon_name}" + (f" ({common})" if common else "")
     print(f"\n=== {label} ===")
-    print(f"taxon_id: {taxon_id}")
+    print(f"taxon_id: {taxon_id}  rank: {taxon.get('rank') or 'unknown'}")
     if observations_count is not None:
-        print(f"iNaturalist observations (including descendants): {observations_count}")
+        print(f"iNaturalist observations (species and infraspecific taxa): {observations_count}")
 
     folder_name = re.sub(r"[^\w\-.]+", "_", taxon_name).strip("_") or str(taxon_id)
     dest_dir = out_dir / folder_name
@@ -428,6 +478,8 @@ def download_taxon_photos(
         "size": size,
         "quality": quality,
         "licensed_only": licensed_only,
+        "api_delay_sec": client.api_delay_sec,
+        "photo_delay_sec": photo_delay_sec,
         "out_dir": str(out_dir),
         "already_in_metadata": len(in_metadata),
     }
@@ -468,9 +520,20 @@ def download_taxon_photos(
                 if not square_url:
                     continue
                 photo_url = sized_photo_url(square_url, size)
-                filename = f"obs{obs_id}_photo{photo_id}{photo_extension(photo_url)}"
+                ext = photo_extension(photo_url)
+                original_name = f"obs{obs_id}_photo{photo_id}{ext}"
+                obs_taxon_name = (observation.get("taxon") or {}).get("name") or taxon_name
+                filename = make_photo_filename(
+                    obs_taxon_name,
+                    observation.get("place_guess") or "",
+                    original_name,
+                )
                 local_path = dest_dir / filename
-                already_have = photo_id in known_ids or local_path.exists()
+                already_have = (
+                    photo_id in known_ids
+                    or local_path.exists()
+                    or (dest_dir / original_name).exists()
+                )
                 if already_have:
                     skipped += 1
                     if photo_id not in in_metadata:
@@ -512,7 +575,7 @@ def download_taxon_photos(
                         f"Downloaded {saved} new photos "
                         f"(skipped existing {skipped}, skipped all-rights-reserved {reserved_skipped})"
                     )
-                time.sleep(PHOTO_DELAY_SEC)
+                time.sleep(photo_delay_sec)
     finally:
         if not hit_quota and (limit is None or saved < limit):
             print("No more undownloaded photos available.")
@@ -626,6 +689,8 @@ def main() -> None:
     else:
         limit = settings["photo_limit"]
     licensed_only = True if args.licensed_only else settings["licensed_only"]
+    api_delay_sec = settings["api_delay_sec"]
+    photo_delay_sec = settings["photo_delay_sec"]
 
     out_dir.mkdir(parents=True, exist_ok=True)
     copy_config_file(config_path, out_dir / "config.yaml")
@@ -638,6 +703,8 @@ def main() -> None:
             "size": size,
             "quality": quality,
             "licensed_only": licensed_only,
+            "api_delay_sec": api_delay_sec,
+            "photo_delay_sec": photo_delay_sec,
             "out_dir": str(out_dir),
             "source_config": str(config_path) if config_path else None,
         },
@@ -645,8 +712,9 @@ def main() -> None:
 
     print(f"Output directory: {out_dir}")
     print(f"Species: {len(species)}; new photos per species this run: {limit_text(limit)}")
+    print(f"Delays: API {api_delay_sec}s, photos {photo_delay_sec}s")
 
-    client = InatClient()
+    client = InatClient(api_delay_sec=api_delay_sec)
     for query in species:
         try:
             download_taxon_photos(
@@ -657,6 +725,7 @@ def main() -> None:
                 quality=quality,
                 limit=limit,
                 licensed_only=licensed_only,
+                photo_delay_sec=photo_delay_sec,
                 source_config=config_path,
             )
         except Exception as exc:
